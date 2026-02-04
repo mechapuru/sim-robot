@@ -130,6 +130,11 @@ class UR5Robotiq85:
             jointRanges=self.arm_joint_ranges,
             restPoses=self.arm_rest_poses,
         )
+        # Only return the arm joint positions
+        return joint_poses[: self.arm_num_dofs]
+
+    def set_arm_joints(self, joint_poses):
+        """Directly set the motor control for arm joints."""
         for i, joint_id in enumerate(self.arm_controllable_joints):
             p.setJointMotorControl2(
                 self.id,
@@ -207,6 +212,218 @@ class UR5Robotiq85:
             state = np.concatenate([eef_pos, eef_orn_euler, joint_states, [normalized_gripper]])
             return state
         
+
+
+class RRTConnect:
+    def __init__(self, robot, obstacle_ids=None, step_size=0.15, max_iters=5000):
+        self.robot = robot
+        self.obstacle_ids = obstacle_ids if obstacle_ids is not None else []
+        self.step_size = step_size
+        self.max_iters = max_iters
+        self.lower_limits = np.array(robot.arm_lower_limits)
+        self.upper_limits = np.array(robot.arm_upper_limits)
+
+    def is_collision_free(self, q):
+        """Check if joint configuration q is collision-free."""
+        # Store current state
+        current_q = [p.getJointState(self.robot.id, i)[0] for i in self.robot.arm_controllable_joints]
+        
+        # Reset joints to q for check
+        for i, joint_id in enumerate(self.robot.arm_controllable_joints):
+            p.resetJointState(self.robot.id, joint_id, q[i])
+        
+        p.performCollisionDetection()
+        
+        collision = False
+        contact_points = p.getContactPoints(self.robot.id)
+        if contact_points:
+            for contact in contact_points:
+                other_body_id = contact[2]
+                own_link_index = contact[3]
+                
+                # IGNORE collisions with self, base mounting links, and explicitly ignored bodies (like a held cube)
+                if other_body_id != self.robot.id and other_body_id not in self.obstacle_ids and own_link_index > 0:
+                    collision = True
+                    break
+        
+        # Restore
+        for i, joint_id in enumerate(self.robot.arm_controllable_joints):
+            p.resetJointState(self.robot.id, joint_id, current_q[i])
+            
+        return not collision
+
+    def sample_q(self):
+        """Sample a random valid joint configuration."""
+        return np.random.uniform(self.lower_limits, self.upper_limits)
+
+    def plan(self, q_start, q_goal):
+        """RRT-Connect planning algorithm."""
+        if not self.is_collision_free(q_start):
+            print("  Planning error: Start state in collision!")
+            return None
+        if not self.is_collision_free(q_goal):
+            print("  Planning error: Goal state in collision!")
+            return None
+
+        p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)
+
+        # Track which tree is connected to Start and which to Goal
+        tree_start = {tuple(q_start): None}
+        tree_goal = {tuple(q_goal): None}
+        
+        tree_a, tree_b = tree_start, tree_goal
+        a_is_start = True
+        
+        path = None
+        for _ in range(self.max_iters):
+            q_rand = self.sample_q()
+            q_near_a = self.get_nearest(tree_a, q_rand)
+            q_new_a = self.step_towards(q_near_a, q_rand)
+            
+            if q_new_a is not None and self.is_collision_free(q_new_a):
+                # CRITICAL: Store parent as tuple to maintain hashability
+                tree_a[tuple(q_new_a)] = tuple(q_near_a)
+                
+                # Connect Tree B to new node in A
+                q_near_b = self.get_nearest(tree_b, q_new_a)
+                curr_q_b = q_near_b
+                while True:
+                    q_new_b = self.step_towards(curr_q_b, q_new_a)
+                    if q_new_b is None or not self.is_collision_free(q_new_b):
+                        break
+                    tree_b[tuple(q_new_b)] = tuple(curr_q_b)
+                    curr_q_b = q_new_b
+                    
+                    if np.linalg.norm(np.array(curr_q_b) - np.array(q_new_a)) < self.step_size:
+                        if a_is_start:
+                            path = self.extract_ordered_path(tree_start, q_new_a, tree_goal, curr_q_b)
+                        else:
+                            path = self.extract_ordered_path(tree_start, curr_q_b, tree_goal, q_new_a)
+                        break
+                if path: break
+
+            # Swap trees
+            tree_a, tree_b = tree_b, tree_a
+            a_is_start = not a_is_start
+
+        p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
+        return path
+
+    def extract_ordered_path(self, tree_start, q_s, tree_goal, q_g):
+        """Helper to combine start_tree and goal_tree into sequence."""
+        path_start = []
+        curr = tuple(q_s)
+        while curr is not None:
+            path_start.append(curr)
+            curr = tree_start[curr]
+        path_start.reverse()
+        
+        path_goal = []
+        curr = tuple(q_g)
+        while curr is not None:
+            path_goal.append(curr)
+            curr = tree_goal[curr]
+            
+        return path_start + path_goal
+
+    def get_nearest(self, tree, q_target):
+        nodes = np.array(list(tree.keys()))
+        distances = np.linalg.norm(nodes - q_target, axis=1)
+        return nodes[np.argmin(distances)]
+
+    def step_towards(self, q_from, q_to):
+        diff = np.array(q_to) - np.array(q_from)
+        dist = np.linalg.norm(diff)
+        if dist < 1e-6:
+            return None
+        step = diff * min(self.step_size / dist, 1.0)
+        return np.array(q_from) + step
+
+    def extract_path(self, tree_a, q_a, tree_b, q_b):
+        path_a = []
+        curr = tuple(q_a)
+        while curr is not None:
+            path_a.append(curr)
+            curr = tree_a[curr]
+        path_a.reverse()
+        
+        path_b = []
+        curr = tuple(q_b)
+        while curr is not None:
+            path_b.append(curr)
+            curr = tree_b[curr]
+            
+        # Determine which path belongs to which tree (start/goal)
+        # Note: tree_a initially started as the 'start' tree, but they swap.
+        # But we can just return combined path.
+        return path_a + path_b
+
+    def smooth_path(self, path, max_iters=100):
+        """Simple path shortcutting to smooth the RRT output."""
+        if len(path) < 3:
+            return path
+        
+        smoothed = list(path)
+        for _ in range(max_iters):
+            if len(smoothed) < 3:
+                break
+            i = random.randint(0, len(smoothed) - 2)
+            j = random.randint(i + 1, len(smoothed) - 1)
+            
+            if self.is_path_collision_free(smoothed[i], smoothed[j]):
+                smoothed = smoothed[:i+1] + smoothed[j:]
+                
+        return smoothed
+
+    def is_path_collision_free(self, q1, q2, steps=10):
+        """Check if straight line between q1 and q2 is collision-free."""
+        for i in range(steps + 1):
+            q = np.array(q1) + (np.array(q2) - np.array(q1)) * (i / steps)
+            if not self.is_collision_free(q):
+                return False
+        return True
+
+
+def execute_planned_path(robot, path, steps_per_segment=10, 
+                         capture_frames=True, iter_folder=None,
+                         frame_counter=None, base_pos=None,
+                         state_history=None, cube_id=None,
+                         cube_pos_history=None, table_id=None,
+                         plane_id=None, tray_id=None, EXCLUDE_TABLE=True):
+    """Interpolate and execute a sequence of joint waypoints."""
+    if path is None:
+        print("Error: No path to execute")
+        return
+
+    for i in range(len(path) - 1):
+        q_start = np.array(path[i])
+        q_end = np.array(path[i+1])
+        
+        for j in range(steps_per_segment):
+            alpha = (j + 1) / steps_per_segment
+            q_interp = q_start + alpha * (q_end - q_start)
+            
+            robot.set_arm_joints(q_interp)
+            
+            # Sub-stepping for physics stability
+            for _ in range(20): 
+                p.stepSimulation()
+
+            update_simulation(
+                1,
+                capture_frames=capture_frames,
+                iter_folder=iter_folder,
+                frame_counter=frame_counter,
+                robot=robot,
+                base_pos=base_pos,
+                state_history=state_history,
+                cube_id=cube_id,
+                cube_pos_history=cube_pos_history,
+                table_id=table_id,
+                plane_id=plane_id,
+                tray_id=tray_id,
+                EXCLUDE_TABLE=EXCLUDE_TABLE
+            )
 
 
 def interpolate_gripper(robot, target_angle, steps=60, 
@@ -644,7 +861,7 @@ def save_point_cloud_ply(points, colors, filename, exclude_mask=None):
 
 def setup_simulation():
 
-    p.connect(p.DIRECT)
+    p.connect(p.GUI)
     print("PyBullet running in DIRECT (headless) mode")
 
     p.setGravity(0, 0, -9.8)
@@ -759,29 +976,69 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
         eef_state = robot.get_current_ee_position()
         eef_orientation = eef_state[1]
 
+        # Initialize planner with higher iteration budget
+        # We ignore cube_id because it's the target object we are interacting with
+        planner = RRTConnect(robot, max_iters=10000, obstacle_ids=[cube_id])
+
         # Phase 1: Move above cube
         print("Phase 1: Moving above cube...")
-        robot.move_arm_ik([cube_start_pos[0], cube_start_pos[1], 0.83], eef_orientation)
-        update_simulation(
-            50, capture_frames=True, iter_folder=temp_folder,
-            frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
-            state_history=state_history, cube_id=cube_id,
-            cube_pos_history=cube_pos_history, table_id=table_id,
-            plane_id=plane_id, tray_id=tray_id,
-            EXCLUDE_TABLE=EXCLUDE_TABLE
-        )
+        q_start = [p.getJointState(robot.id, i)[0] for i in robot.arm_controllable_joints]
+        q_goal = robot.move_arm_ik([cube_start_pos[0], cube_start_pos[1], 0.83], eef_orientation)
+        
+        print("  Planning path...")
+        path = planner.plan(q_start, q_goal)
+        if path:
+            print("  Path found! Smoothing...")
+            path = planner.smooth_path(path)
+            execute_planned_path(
+                robot, path, capture_frames=True, iter_folder=temp_folder,
+                frame_counter=frame_counter, base_pos=robot.base_pos,
+                state_history=state_history, cube_id=cube_id,
+                cube_pos_history=cube_pos_history, table_id=table_id,
+                plane_id=plane_id, tray_id=tray_id,
+                EXCLUDE_TABLE=EXCLUDE_TABLE
+            )
+        else:
+            print("  Planning failed! Falling back to linear IK move.")
+            robot.set_arm_joints(q_goal)
+            update_simulation(
+                100, capture_frames=True, iter_folder=temp_folder,
+                frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
+                state_history=state_history, cube_id=cube_id,
+                cube_pos_history=cube_pos_history, table_id=table_id,
+                plane_id=plane_id, tray_id=tray_id,
+                EXCLUDE_TABLE=EXCLUDE_TABLE
+            )
 
         # Phase 2: Move down to grasp
         print("Phase 2: Moving down to grasp...")
-        robot.move_arm_ik([cube_start_pos[0], cube_start_pos[1], 0.78], eef_orientation)
-        update_simulation(
-            50, capture_frames=True, iter_folder=temp_folder,
-            frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
-            state_history=state_history, cube_id=cube_id,
-            cube_pos_history=cube_pos_history, table_id=table_id,
-            plane_id=plane_id, tray_id=tray_id,
-            EXCLUDE_TABLE=EXCLUDE_TABLE
-        )
+        q_start = [p.getJointState(robot.id, i)[0] for i in robot.arm_controllable_joints]
+        q_goal = robot.move_arm_ik([cube_start_pos[0], cube_start_pos[1], 0.78], eef_orientation)
+        
+        print("  Planning path...")
+        path = planner.plan(q_start, q_goal)
+        if path:
+            print("  Path found! Smoothing...")
+            path = planner.smooth_path(path)
+            execute_planned_path(
+                robot, path, capture_frames=True, iter_folder=temp_folder,
+                frame_counter=frame_counter, base_pos=robot.base_pos,
+                state_history=state_history, cube_id=cube_id,
+                cube_pos_history=cube_pos_history, table_id=table_id,
+                plane_id=plane_id, tray_id=tray_id,
+                EXCLUDE_TABLE=EXCLUDE_TABLE
+            )
+        else:
+            print("  Planning failed! Falling back to linear IK move.")
+            robot.set_arm_joints(q_goal)
+            update_simulation(
+                100, capture_frames=True, iter_folder=temp_folder,
+                frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
+                state_history=state_history, cube_id=cube_id,
+                cube_pos_history=cube_pos_history, table_id=table_id,
+                plane_id=plane_id, tray_id=tray_id,
+                EXCLUDE_TABLE=EXCLUDE_TABLE
+            )
 
         # Phase 3: Close gripper
         print("Phase 3: Closing gripper...")
@@ -797,31 +1054,66 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
 
         # Phase 4: Lift cube
         print("Phase 4: Lifting cube...")
-        robot.move_arm_ik([cube_start_pos[0], cube_start_pos[1], 1.18], eef_orientation)
-        update_simulation(
-            50, capture_frames=True, iter_folder=temp_folder,
-            frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
-            state_history=state_history, cube_id=cube_id,
-            cube_pos_history=cube_pos_history, table_id=table_id,
-            plane_id=plane_id, tray_id=tray_id,
-            EXCLUDE_TABLE=EXCLUDE_TABLE 
-        )
+        q_start = [p.getJointState(robot.id, i)[0] for i in robot.arm_controllable_joints]
+        q_goal = robot.move_arm_ik([cube_start_pos[0], cube_start_pos[1], 1.18], eef_orientation)
+        
+        print("  Planning path...")
+        path = planner.plan(q_start, q_goal)
+        if path:
+            print("  Path found! Smoothing...")
+            path = planner.smooth_path(path)
+            execute_planned_path(
+                robot, path, capture_frames=True, iter_folder=temp_folder,
+                frame_counter=frame_counter, base_pos=robot.base_pos,
+                state_history=state_history, cube_id=cube_id,
+                cube_pos_history=cube_pos_history, table_id=table_id,
+                plane_id=plane_id, tray_id=tray_id,
+                EXCLUDE_TABLE=EXCLUDE_TABLE
+            )
+        else:
+            print("  Planning failed! Falling back to linear IK move.")
+            robot.set_arm_joints(q_goal)
+            update_simulation(
+                100, capture_frames=True, iter_folder=temp_folder,
+                frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
+                state_history=state_history, cube_id=cube_id,
+                cube_pos_history=cube_pos_history, table_id=table_id,
+                plane_id=plane_id, tray_id=tray_id,
+                EXCLUDE_TABLE=EXCLUDE_TABLE
+            )
 
         # Phase 5: Move above tray
         print("Phase 5: Moving to tray...")
         tray_offset = random.uniform(0.1, 0.3)
         target_tray_pos = [tray_pos[0] + tray_offset, tray_pos[1] + tray_offset, tray_pos[2] + 0.56]
-        print(f"  Target position: [{target_tray_pos[0]:.4f}, {target_tray_pos[1]:.4f}, {target_tray_pos[2]:.4f}]")
         
-        robot.move_arm_ik(target_tray_pos, eef_orientation)
-        update_simulation(
-            150, capture_frames=True, iter_folder=temp_folder,
-            frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
-            state_history=state_history, cube_id=cube_id,
-            cube_pos_history=cube_pos_history, table_id=table_id,
-            plane_id=plane_id, tray_id=tray_id,
-            EXCLUDE_TABLE=EXCLUDE_TABLE
-        )
+        q_start = [p.getJointState(robot.id, i)[0] for i in robot.arm_controllable_joints]
+        q_goal = robot.move_arm_ik(target_tray_pos, eef_orientation)
+        
+        print("  Planning path...")
+        path = planner.plan(q_start, q_goal)
+        if path:
+            print("  Path found! Smoothing...")
+            path = planner.smooth_path(path)
+            execute_planned_path(
+                robot, path, capture_frames=True, iter_folder=temp_folder,
+                frame_counter=frame_counter, base_pos=robot.base_pos,
+                state_history=state_history, cube_id=cube_id,
+                cube_pos_history=cube_pos_history, table_id=table_id,
+                plane_id=plane_id, tray_id=tray_id,
+                EXCLUDE_TABLE=EXCLUDE_TABLE
+            )
+        else:
+            print("  Planning failed! Falling back to linear IK move.")
+            robot.set_arm_joints(q_goal)
+            update_simulation(
+                150, capture_frames=True, iter_folder=temp_folder,
+                frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
+                state_history=state_history, cube_id=cube_id,
+                cube_pos_history=cube_pos_history, table_id=table_id,
+                plane_id=plane_id, tray_id=tray_id,
+                EXCLUDE_TABLE=EXCLUDE_TABLE
+            )
 
         # Phase 6: Open gripper to release
         print("Phase 6: Opening gripper to release...")
