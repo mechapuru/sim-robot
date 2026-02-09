@@ -193,7 +193,7 @@ class UR5Robotiq85(Robot):
         
         return normalized
     
-    def set_gripper(self, value: float, use_position_control: bool = False):
+    def set_gripper(self, value: float, use_position_control: bool = True):
         """
         Set gripper opening.
         
