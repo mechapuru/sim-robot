@@ -9,6 +9,29 @@ import cv2
 import numpy as np
 import json
 
+CUBE_LENGTH = 0.05
+
+def create_cylinder(radius, height, pos, color=[0.7, 0.7, 0.7, 1]):
+    """Creates a cylinder body using primitives."""
+    visual_shape = p.createVisualShape(
+        p.GEOM_CYLINDER,
+        radius=radius,
+        length=height,
+        rgbaColor=color
+    )
+    collision_shape = p.createCollisionShape(
+        p.GEOM_CYLINDER,
+        radius=radius,
+        height=height
+    )
+    body_id = p.createMultiBody(
+        baseMass=0,  # Static object
+        baseCollisionShapeIndex=collision_shape,
+        baseVisualShapeIndex=visual_shape,
+        basePosition=[pos[0], pos[1], pos[2] + height/2] # Center vertically
+    )
+    return body_id
+
 
 class XArm6Robotiq85:
     def __init__(self, pos, ori):
@@ -264,8 +287,8 @@ def interpolate_gripper(robot, target_angle,
         current_angle = current_gripper_state[0]
 
         # Stopping condition
-        if target_angle > 0.36:  # Closing
-            if current_angle > 0.36:
+        if target_angle > 0.35:  # Closing
+            if current_angle > 0.35:
                 break
         else:  # Opening
             if current_angle <= target_angle + 0.01:
@@ -538,12 +561,20 @@ def setup_simulation(freq=240, gui=False):
     table_id = p.loadURDF(
         "table/table.urdf", [0.5, 0, 0], p.getQuaternionFromEuler([0, 0, 0])
     )
-    tray_pos = [0.25, 0.3, 0.6]
-    tray_orn = p.getQuaternionFromEuler([0, 0, 0])
-    # tray_id = p.loadURDF("tray/tray.urdf", tray_pos, tray_orn)
-    tray_id = None
+    # tray_pos = [0.25, 0.3, 0.6]
+    # tray_orn = p.getQuaternionFromEuler([0, 0, 0])
+    # # tray_id = p.loadURDF("tray/tray.urdf", tray_pos, tray_orn)
+    # tray_id = None
 
-    return tray_pos, tray_orn, table_id, plane_id, tray_id
+    # return tray_pos, tray_orn, table_id, plane_id, tray_id
+
+    target_pos = [0.3, 0.3, 0.625]  # Base position on table
+    target_radius = 0.05  # 10cm diameter
+    target_height = 0.04  # 4cm height
+    # Cylinder color: Orange
+    cylinder_id = create_cylinder(target_radius, target_height, target_pos, color=[1, 0.5, 0, 1])
+
+    return target_pos, None, table_id, plane_id, cylinder_id
 
 
 def move_to_pose_dynamic(
@@ -661,7 +692,8 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
         cube_id = p.loadURDF("cube_small.urdf", cube_start_pos, cube_start_orn)
         # Increase friction of the cube itself
         p.changeDynamics(cube_id, -1, lateralFriction=5.0, spinningFriction=5, rollingFriction=5)
-        random_color_cube(cube_id)
+        # Cube color: Black
+        p.changeVisualShape(cube_id, -1, rgbaColor=[0, 0, 0, 1])
 
         print(f"Cube spawned at: [{cube_start_pos[0]:.4f}, {cube_start_pos[1]:.4f}, {cube_start_pos[2]:.4f}]")
 
@@ -683,7 +715,7 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
         # Phase 2: Move down to grasp
         print("Phase 2: Moving down to grasp...")
         move_to_pose_dynamic(
-            robot, [cube_start_pos[0], cube_start_pos[1], 0.80], eef_orientation,
+            robot, [cube_start_pos[0], cube_start_pos[1], 0.78], eef_orientation,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
@@ -716,14 +748,15 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
             EXCLUDE_TABLE=EXCLUDE_TABLE
         )
 
-        # Phase 5: Move above tray
-        print("Phase 5: Moving to tray...")
-        tray_offset = random.uniform(0.0, 0.1)
-        target_tray_pos = [tray_pos[0] + tray_offset, tray_pos[1] + tray_offset, tray_pos[2] + 0.30]
-        print(f"  Target position: [{target_tray_pos[0]:.4f}, {target_tray_pos[1]:.4f}, {target_tray_pos[2]:.4f}]")
+        # Phase 5: Move above cylinder
+        print("Phase 5: Moving above cylinder target...")
+        # Target the top of the cylinder [0.3, 0.3, 0.625 + 0.04] + half cube height [0.025] + safety margin
+        cylinder_height = 0.04
+        target_drop_pos = [tray_pos[0], tray_pos[1], tray_pos[2] + cylinder_height + CUBE_LENGTH/2 + 0.15]
+        print(f"  Target position: [{target_drop_pos[0]:.4f}, {target_drop_pos[1]:.4f}, {target_drop_pos[2]:.4f}]")
 
         move_to_pose_dynamic(
-            robot, target_tray_pos, eef_orientation,
+            robot, target_drop_pos, eef_orientation,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
@@ -750,20 +783,23 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
             p.stepSimulation()
 
         # ============ CHECK SUCCESS ============
-        # tray_min, tray_max = p.getAABB(tray_id)
-        
-        # Since tray is removed, we'll consider success if the cube is near the target tray position
+        # Cylinder Top Success: Cube centered on cylinder and resting on its surface
         cube_final_pos = p.getBasePositionAndOrientation(cube_id)[0]
-        dist_to_target = np.linalg.norm(np.array(cube_final_pos[:2]) - np.array(tray_pos[:2]))
+        dist_to_center = np.linalg.norm(np.array(cube_final_pos[:2]) - np.array(tray_pos[:2]))
         
-        # Success if cube is within 0.2m of target and on the table
-        inside_tray = dist_to_target < 0.2 and cube_final_pos[2] > 0.6
+        cylinder_height = 0.04
+        cylinder_radius = 0.05
+        cylinder_top_z = tray_pos[2] + cylinder_height
+        
+        # Success if cube is on cylinder (dist < radius) and high enough (z > cylinder_top)
+        # Cube center should be at cylinder_top_z + CUBE_LENGTH/2 = 0.665 + 0.025 = 0.69
+        inside_tray = dist_to_center < cylinder_radius and cube_final_pos[2] > cylinder_top_z + 0.01
 
         cube_final_pos = p.getBasePositionAndOrientation(cube_id)[0]
 
         if inside_tray:
             print(f"\n{'='*60}")
-            print(f"🎉 SUCCESS! Cube in tray at {cube_final_pos}")
+            print(f"🎉 SUCCESS! Cube on cylinder at {cube_final_pos}")
             print(f"{'='*60}\n")
 
             # Save this successful trajectory
@@ -866,7 +902,7 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
 
         else:
             print(f"\n{'='*60}")
-            print(f"❌ FAILED - Cube missed tray, ended at {cube_final_pos}")
+            print(f"❌ FAILED - Cube missed cylinder, ended at {cube_final_pos}")
             print(f"{'='*60}\n")
 
             # Delete temp folder for failed attempt
@@ -912,10 +948,10 @@ def main():
     Or else False to include table in point clouds
     """
 
-    tray_pos, _, table_id, plane_id, _ = setup_simulation(freq=60, gui=True)
+    tray_pos, _, table_id, plane_id, cylinder_id = setup_simulation(freq=60, gui=True)
     robot = XArm6Robotiq85([0, 0, 0.62], [0, 0, 0])
     robot.load()
-    move_and_grab_cube(robot, tray_pos, table_id, plane_id, None, EXCLUDE_TABLE=EXCLUDE_TABLE)
+    move_and_grab_cube(robot, tray_pos, table_id, plane_id, cylinder_id, EXCLUDE_TABLE=EXCLUDE_TABLE)
 
 
 if __name__ == "__main__":
