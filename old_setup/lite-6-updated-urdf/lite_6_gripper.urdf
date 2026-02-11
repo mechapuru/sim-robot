@@ -1,0 +1,63 @@
+<?xml version="1.0"?>
+<robot name="gripper_model">
+
+  <!-- Base -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/base.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="gray">
+        <color rgba="0.7 0.7 0.7 1"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/base.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+  </link>
+  
+  <!-- Left finger -->
+  <link name="left_finger">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/left_finger.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/left_finger.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_finger_joint" type="prismatic">
+    <parent link="base_link"/>
+    <child link="left_finger"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/> <!-- move along X axis; adjust if needed -->
+    <limit lower="0.0" upper="0.04" effort="120" velocity="0.1"/>
+  </joint>
+
+  <!-- Right finger -->
+  <link name="right_finger">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/right_finger.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/right_finger.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_finger_joint" type="prismatic">
+    <parent link="base_link"/>
+    <child link="right_finger"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="-1 0 0"/> <!-- opposite direction to left finger -->
+    <limit lower="0.0" upper="0.04" effort="120" velocity="0.1"/>
+  </joint>
+
+</robot>
