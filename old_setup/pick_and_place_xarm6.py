@@ -214,6 +214,43 @@ class XArm6Robotiq85:
         for _ in range(10):
             p.stepSimulation()
 
+    def reset_posture(self):
+        """Robustly reset the robot to the initial pose and gripper open."""
+        # Initial reset posture [125.0, 10.0, 177.0, 3.14, 0.0, 0.0]
+        initial_pos_world = [0.125, 0.01, 0.62 + 0.377]
+        initial_orn_world = p.getQuaternionFromEuler([3.14, 0, 0])
+
+        target_joint_positions = p.calculateInverseKinematics(
+            self.id,
+            self.eef_id,
+            initial_pos_world,
+            initial_orn_world,
+            lowerLimits=self.arm_lower_limits,
+            upperLimits=self.arm_upper_limits,
+            jointRanges=self.arm_joint_ranges,
+            restPoses=self.arm_rest_poses,
+        )
+
+        # Disable motor control during teleport to avoid fighting
+        for j in range(p.getNumJoints(self.id)):
+            p.setJointMotorControl2(self.id, j, p.VELOCITY_CONTROL, force=0)
+
+        for i, joint_id in enumerate(self.arm_controllable_joints):
+            p.resetJointState(self.id, joint_id, target_joint_positions[i], targetVelocity=0)
+            p.setJointMotorControl2(self.id, joint_id, p.POSITION_CONTROL, targetPosition=target_joint_positions[i], force=1000)
+
+        # Reset gripper joints to open (0.0)
+        p.resetJointState(self.id, self.mimic_parent_id, 0.0, targetVelocity=0)
+        p.setJointMotorControl2(self.id, self.mimic_parent_id, p.POSITION_CONTROL, targetPosition=0.0, force=500)
+        
+        for joint_id, multiplier in self.mimic_child_multiplier.items():
+            p.resetJointState(self.id, joint_id, 0.0, targetVelocity=0)
+            p.setJointMotorControl2(self.id, joint_id, p.POSITION_CONTROL, targetPosition=0.0, force=500)
+
+        # Settle physics
+        for _ in range(100):
+            p.stepSimulation()
+
     def get_current_ee_position(self):
         eef_state = p.getLinkState(self.id, self.eef_id)
         return eef_state[0], eef_state[1]
@@ -624,6 +661,11 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
     print(f"Target: 36 successful trajectories")
     print("="*60 + "\n")
 
+    # PRIME THE ROBOT: Reset once before the first attempt starts
+    # This ensures ATTEMPT 1 starts at the same pose as all others.
+    print("Priming robot for collection...")
+    robot.reset_posture()
+
     cube_id = None
     while successful_iterations < 36:
         # Create temp folder for this attempt
@@ -646,42 +688,9 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
         print(f"ATTEMPT {total_attempts + 1} (Successful: {successful_iterations}/36)")
         print(f"{'='*60}\n")
 
-        # 1. Calculate IK for the initial reset posture [125.0, 10.0, 177.0, 3.14, 0.0, 0.0]
-        initial_pos_world = [0.125, 0.01, 0.62 + 0.377]
-        initial_orn_world = p.getQuaternionFromEuler([3.14, 0, 0])
-        
-        target_joint_positions = p.calculateInverseKinematics(
-            robot.id,
-            robot.eef_id,
-            initial_pos_world,
-            initial_orn_world,
-            lowerLimits=robot.arm_lower_limits,
-            upperLimits=robot.arm_upper_limits,
-            jointRanges=robot.arm_joint_ranges,
-            restPoses=robot.arm_rest_poses,
-        )
-
-        # 2. Robust Reset: Teleport instantly and reset velocities
+        # Robust Reset: Teleport instantly and reset velocities
         print("Resetting robot posture and gripper...")
-        # Disable motor control during teleport to avoid fighting
-        for j in range(p.getNumJoints(robot.id)):
-            p.setJointMotorControl2(robot.id, j, p.VELOCITY_CONTROL, force=0)
-
-        for i, joint_id in enumerate(robot.arm_controllable_joints):
-            p.resetJointState(robot.id, joint_id, target_joint_positions[i], targetVelocity=0)
-            p.setJointMotorControl2(robot.id, joint_id, p.POSITION_CONTROL, targetPosition=target_joint_positions[i], force=1000)
-
-        # Reset gripper joints to open (0.0)
-        p.resetJointState(robot.id, robot.mimic_parent_id, 0.0, targetVelocity=0)
-        p.setJointMotorControl2(robot.id, robot.mimic_parent_id, p.POSITION_CONTROL, targetPosition=0.0, force=500)
-        
-        for joint_id, multiplier in robot.mimic_child_multiplier.items():
-            p.resetJointState(robot.id, joint_id, 0.0, targetVelocity=0)
-            p.setJointMotorControl2(robot.id, joint_id, p.POSITION_CONTROL, targetPosition=0.0, force=500)
-
-        # Settle physics
-        for _ in range(100):
-            p.stepSimulation()
+        robot.reset_posture()
 
         actual_angle = p.getJointState(robot.id, robot.mimic_parent_id)[0]
         print(f"Robot reset complete. Gripper angle: {actual_angle:.4f}\n")
@@ -715,7 +724,7 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
         # Phase 2: Move down to grasp
         print("Phase 2: Moving down to grasp...")
         move_to_pose_dynamic(
-            robot, [cube_start_pos[0], cube_start_pos[1], 0.78], eef_orientation,
+            robot, [cube_start_pos[0], cube_start_pos[1], 0.80], eef_orientation,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
@@ -739,7 +748,7 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
         # Phase 4: Lift cube
         print("Phase 4: Lifting cube...")
         move_to_pose_dynamic(
-            robot, [cube_start_pos[0], cube_start_pos[1], 0.90], eef_orientation,
+            robot, [cube_start_pos[0], cube_start_pos[1], 1.00], eef_orientation,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
@@ -752,7 +761,7 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
         print("Phase 5: Moving above cylinder target...")
         # Target the top of the cylinder [0.3, 0.3, 0.625 + 0.04] + half cube height [0.025] + safety margin
         cylinder_height = 0.04
-        target_drop_pos = [tray_pos[0], tray_pos[1], tray_pos[2] + cylinder_height + CUBE_LENGTH/2 + 0.15]
+        target_drop_pos = [tray_pos[0], tray_pos[1], tray_pos[2] + cylinder_height + CUBE_LENGTH/2 + 0.2]
         print(f"  Target position: [{target_drop_pos[0]:.4f}, {target_drop_pos[1]:.4f}, {target_drop_pos[2]:.4f}]")
 
         move_to_pose_dynamic(
