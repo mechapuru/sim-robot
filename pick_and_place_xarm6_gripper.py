@@ -285,7 +285,7 @@ class Lite6Robot:
         # Anything tighter than -0.024 is capped at 1.0
         
         open_pos = -0.04
-        grasp_pos = -0.024 # Target close position for 5cm box
+        grasp_pos = -0.028 # Target close position for 5cm box
         
         if abs(grasp_pos - open_pos) < 1e-5:
             normalized_gripper = 0.0
@@ -773,7 +773,7 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
 
     cube_id = None
     cylinder_id = None
-    while successful_iterations < 150:
+    while successful_iterations < 1:
         # Create temp folder for this attempt
         temp_folder = os.path.join(base_save_dir, f"temp_iter_{total_attempts:04d}")
         os.makedirs(temp_folder, exist_ok=True)
