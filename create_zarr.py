@@ -15,8 +15,11 @@ Directory layout expected (relative to DATA_ROOT):
       ...
 
 Actions stored in the Zarr:
-  - First 6 dims (joints): kept as absolute targets  (actions[:, :6])
-  - 7th dim (gripper):     stored as delta = action_gripper - state_gripper
+  --action-mode absolute:
+       - First 6 dims (joints): kept as absolute targets  (actions[:, :6])
+       - 7th dim (gripper):     stored as delta = action_gripper - state_gripper
+  --action-mode delta:
+       - All 7 dims (joints + gripper) stored as delta = action - state
 """
 
 import os
@@ -25,121 +28,164 @@ import numpy as np
 import zarr
 from PIL import Image
 from tqdm import tqdm
+import argparse
 
-# ── paths ────────────────────────────────────────────────────────────────────
-DATA_ROOT = "/Users/darshiljariwala/Desktop/Robot-Sim/pybullet/old_setup/dataset"
-OUT_ZARR  = "/Users/darshiljariwala/Desktop/Robot-Sim/pybullet/old_setup/rrc_sim_dataset.zarr"
+def main():
+    parser = argparse.ArgumentParser(description="Convert simulation pick-and-place dataset into a Zarr store.")
+    parser.add_argument("--action-mode", type=str, choices=['absolute', 'delta'], default='absolute',
+                        help="Action space mode: 'absolute' (only gripper is delta) or 'delta' (all joints are delta)")
+    parser.add_argument("--data-root", type=str, default="dataset",
+                        help="Path to the raw dataset folder (default: dataset)")
+    parser.add_argument("--out-zarr", type=str, default=None,
+                        help="Output Zarr path (default: rrc_sim_dataset_{mode}.zarr)")
+    args = parser.parse_args()
 
-CHUNK_SIZE = 100  # samples per Zarr chunk
+    DATA_ROOT = args.data_root
+    if args.out_zarr is None:
+        OUT_ZARR = f"rrc_sim_dataset_{args.action_mode}.zarr"
+    else:
+        OUT_ZARR = args.out_zarr
 
-# ── accumulators ─────────────────────────────────────────────────────────────
-all_imgs    = []
-all_pcs     = []
-all_actions = []
-all_states  = []
-episode_ends = []
-current_idx  = 0
+    CHUNK_SIZE = 100  # samples per Zarr chunk
 
-# ── discover trajectories ───────────────────────────────────────────────────
-trajectories = sorted(
-    d for d in os.listdir(DATA_ROOT)
-    if os.path.isdir(os.path.join(DATA_ROOT, d)) and d.startswith("iter_")
-)
-print(f"Found {len(trajectories)} trajectories in {DATA_ROOT}")
+    # ── accumulators ─────────────────────────────────────────────────────────────
+    all_imgs    = []
+    all_pcs     = []
+    all_actions = []
+    all_states  = []
+    episode_ends = []
+    current_idx  = 0
 
-for traj in tqdm(trajectories, desc="Trajectories"):
-    traj_dir = os.path.join(DATA_ROOT, traj)
+    # ── discover trajectories ───────────────────────────────────────────────────
+    if not os.path.exists(DATA_ROOT):
+        print(f"Error: Dataset directory '{DATA_ROOT}' does not exist.")
+        return
 
-    # ── load states & actions (.npy) ─────────────────────────────────────
-    state_path  = os.path.join(traj_dir, "agent_pos.npy")
-    action_path = os.path.join(traj_dir, "actions.npy")
+    trajectories = sorted(
+        d for d in os.listdir(DATA_ROOT)
+        if os.path.isdir(os.path.join(DATA_ROOT, d)) and d.startswith("iter_")
+    )
+    print(f"Found {len(trajectories)} trajectories in {DATA_ROOT}")
 
-    if not os.path.exists(state_path) or not os.path.exists(action_path):
-        print(f"  Skipping {traj}: missing agent_pos.npy or actions.npy")
-        continue
+    for traj in tqdm(trajectories, desc="Trajectories"):
+        traj_dir = os.path.join(DATA_ROOT, traj)
 
-    states  = np.load(state_path)   # (N, 7)
-    actions = np.load(action_path)  # (N, 7)
+        # ── load states & actions (.npy) ─────────────────────────────────────
+        state_path  = os.path.join(traj_dir, "agent_pos.npy")
+        action_path = os.path.join(traj_dir, "actions.npy")
 
-    if states.ndim == 1:
-        states = states.reshape(1, -1)
-    if actions.ndim == 1:
-        actions = actions.reshape(1, -1)
+        if not os.path.exists(state_path) or not os.path.exists(action_path):
+            print(f"  Skipping {traj}: missing agent_pos.npy or actions.npy")
+            continue
 
-    num_frames = len(states)
+        states  = np.load(state_path)   # (N, 7)
+        actions = np.load(action_path)  # (N, 7)
 
-    # ── gripper delta: action[i] - state[i] for dim 6 ───────────────────
-    actions[:, 6] = actions[:, 6] - states[:, 6]
+        if states.ndim == 1:
+            states = states.reshape(1, -1)
+        if actions.ndim == 1:
+            actions = actions.reshape(1, -1)
 
-    # ── RGB images ───────────────────────────────────────────────────────
-    rgb_dir = os.path.join(traj_dir, "third_person", "rgb")
-    rgb_files = sorted(f for f in os.listdir(rgb_dir) if f.endswith(".png"))
+        num_frames = len(states)
 
-    if len(rgb_files) != num_frames:
-        print(f"  Skipping {traj}: {num_frames} states vs {len(rgb_files)} images")
-        continue
+        # ── action formatting ────────────────────────────────────────────────
+        if args.action_mode == 'delta':
+            # All 7 dimensions (including gripper) are deltas
+            actions = actions - states
+        else:
+            # First 6 dims are absolute targets, 7th dim (gripper) is delta
+            actions[:, 6] = actions[:, 6] - states[:, 6]
 
-    for f in rgb_files:
-        img = np.array(Image.open(os.path.join(rgb_dir, f)))
-        all_imgs.append(img)
+        # ── RGB images ───────────────────────────────────────────────────────
+        rgb_dir = os.path.join(traj_dir, "third_person", "rgb")
+        if not os.path.exists(rgb_dir):
+            print(f"  Skipping {traj}: RGB directory not found.")
+            continue
+        
+        rgb_files = sorted(f for f in os.listdir(rgb_dir) if f.endswith(".png"))
 
-    # ── Point clouds (.npy) ──────────────────────────────────────────────
-    pcd_dir = os.path.join(traj_dir, "third_person", "pcd")
-    pcd_files = sorted(f for f in os.listdir(pcd_dir) if f.endswith(".npy"))
+        if len(rgb_files) != num_frames:
+            print(f"  Skipping {traj}: {num_frames} states vs {len(rgb_files)} images")
+            continue
 
-    if len(pcd_files) != num_frames:
-        print(f"  Skipping {traj}: {num_frames} states vs {len(pcd_files)} point clouds")
-        # undo images we just appended
-        for _ in range(len(rgb_files)):
-            all_imgs.pop()
-        continue
+        for f in rgb_files:
+            img = np.array(Image.open(os.path.join(rgb_dir, f)))
+            all_imgs.append(img)
 
-    for f in pcd_files:
-        pc = np.load(os.path.join(pcd_dir, f))  # (2500, 3)
-        all_pcs.append(pc)
+        # ── Point clouds (.npy) ──────────────────────────────────────────────
+        pcd_dir = os.path.join(traj_dir, "third_person", "pcd")
+        if not os.path.exists(pcd_dir):
+            print(f"  Skipping {traj}: PCD directory not found.")
+            # undo images we just appended
+            for _ in range(len(rgb_files)):
+                all_imgs.pop()
+            continue
 
-    # ── accumulate ───────────────────────────────────────────────────────
-    all_states.append(states)
-    all_actions.append(actions)
+        pcd_files = sorted(f for f in os.listdir(pcd_dir) if f.endswith(".npy"))
 
-    current_idx += num_frames
-    episode_ends.append(current_idx)
+        if len(pcd_files) != num_frames:
+            print(f"  Skipping {traj}: {num_frames} states vs {len(pcd_files)} point clouds")
+            # undo images we just appended
+            for _ in range(len(rgb_files)):
+                all_imgs.pop()
+            continue
 
-# ── stack everything ─────────────────────────────────────────────────────────
-print("\nStacking arrays …")
-all_imgs     = np.stack(all_imgs, axis=0)           # (total, H, W, 3)
-all_pcs      = np.stack(all_pcs, axis=0)            # (total, 2500, 3)
-all_actions  = np.vstack(all_actions)               # (total, 7)
-all_states   = np.vstack(all_states)                # (total, 7)
-episode_ends = np.array(episode_ends, dtype=np.int64)
+        for f in pcd_files:
+            pc = np.load(os.path.join(pcd_dir, f))  # (2500, 3)
+            all_pcs.append(pc)
 
-print(f"  images       : {all_imgs.shape}")
-print(f"  point_clouds : {all_pcs.shape}")
-print(f"  actions      : {all_actions.shape}  (joints absolute, gripper delta)")
-print(f"  states       : {all_states.shape}")
-print(f"  episodes     : {len(episode_ends)}")
+        # ── accumulate ───────────────────────────────────────────────────────
+        all_states.append(states)
+        all_actions.append(actions)
 
-# ── write Zarr ───────────────────────────────────────────────────────────────
-if os.path.exists(OUT_ZARR):
-    print(f"Removing existing {OUT_ZARR}")
-    shutil.rmtree(OUT_ZARR)
+        current_idx += num_frames
+        episode_ends.append(current_idx)
 
-zroot = zarr.open(OUT_ZARR, mode="w")
-compressor = zarr.Blosc(cname="zstd", clevel=3, shuffle=1)
+    # ── stack everything ─────────────────────────────────────────────────────────
+    if len(all_states) == 0:
+        print("No valid trajectories successfully processed. Exiting.")
+        return
 
-data = zroot.create_group("data")
-meta = zroot.create_group("meta")
+    print("\nStacking arrays …")
+    all_imgs     = np.stack(all_imgs, axis=0)           # (total, H, W, 3)
+    all_pcs      = np.stack(all_pcs, axis=0)            # (total, 2500, 3)
+    all_actions  = np.vstack(all_actions)               # (total, 7)
+    all_states   = np.vstack(all_states)                # (total, 7)
+    episode_ends = np.array(episode_ends, dtype=np.int64)
 
-data.create_dataset("img",         data=all_imgs,    chunks=(CHUNK_SIZE, *all_imgs.shape[1:]),   dtype="uint8",   compressor=compressor)
-data.create_dataset("point_cloud", data=all_pcs,     chunks=(CHUNK_SIZE, *all_pcs.shape[1:]),    dtype="float32", compressor=compressor)
-data.create_dataset("action",      data=all_actions,  chunks=(CHUNK_SIZE, all_actions.shape[1]),  dtype="float32", compressor=compressor)
-data.create_dataset("state",       data=all_states,   chunks=(CHUNK_SIZE, all_states.shape[1]),   dtype="float32", compressor=compressor)
-meta.create_dataset("episode_ends", data=episode_ends, chunks=(len(episode_ends),),               dtype="int64",   compressor=compressor)
+    print(f"  images       : {all_imgs.shape}")
+    print(f"  point_clouds : {all_pcs.shape}")
+    if args.action_mode == 'delta':
+        print(f"  actions      : {all_actions.shape}  (all dimensions are deltas)")
+    else:
+        print(f"  actions      : {all_actions.shape}  (joints absolute, gripper delta)")
+    print(f"  states       : {all_states.shape}")
+    print(f"  episodes     : {len(episode_ends)}")
 
-print(f"\n✅ Saved Zarr to {OUT_ZARR}")
-print("Structure:")
-print(f"  data/img          {all_imgs.shape}")
-print(f"  data/point_cloud  {all_pcs.shape}")
-print(f"  data/action       {all_actions.shape}")
-print(f"  data/state        {all_states.shape}")
-print(f"  meta/episode_ends {episode_ends.shape}")
+    # ── write Zarr ───────────────────────────────────────────────────────────────
+    if os.path.exists(OUT_ZARR):
+        print(f"Removing existing {OUT_ZARR}")
+        shutil.rmtree(OUT_ZARR)
+
+    zroot = zarr.open(OUT_ZARR, mode="w")
+    compressor = zarr.Blosc(cname="zstd", clevel=3, shuffle=1)
+
+    data = zroot.create_group("data")
+    meta = zroot.create_group("meta")
+
+    data.create_dataset("img",         data=all_imgs,    chunks=(CHUNK_SIZE, *all_imgs.shape[1:]),   dtype="uint8",   compressor=compressor)
+    data.create_dataset("point_cloud", data=all_pcs,     chunks=(CHUNK_SIZE, *all_pcs.shape[1:]),    dtype="float32", compressor=compressor)
+    data.create_dataset("action",      data=all_actions,  chunks=(CHUNK_SIZE, all_actions.shape[1]),  dtype="float32", compressor=compressor)
+    data.create_dataset("state",       data=all_states,   chunks=(CHUNK_SIZE, all_states.shape[1]),   dtype="float32", compressor=compressor)
+    meta.create_dataset("episode_ends", data=episode_ends, chunks=(len(episode_ends),),               dtype="int64",   compressor=compressor)
+
+    print(f"\n✅ Saved Zarr to {OUT_ZARR}")
+    print("Structure:")
+    print(f"  data/img          {all_imgs.shape}")
+    print(f"  data/point_cloud  {all_pcs.shape}")
+    print(f"  data/action       {all_actions.shape}")
+    print(f"  data/state        {all_states.shape}")
+    print(f"  meta/episode_ends {episode_ends.shape}")
+
+if __name__ == "__main__":
+    main()
